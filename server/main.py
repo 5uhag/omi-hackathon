@@ -1,23 +1,7 @@
-import os
 import re
-import logging
 from fastapi import FastAPI, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
-import google.generativeai as genai
-import asyncio
-
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set in .env — see .env.example")
-
-genai.configure(api_key=GEMINI_API_KEY)
 
 app = FastAPI(title="Omi Hackathon API")
 
@@ -47,6 +31,18 @@ class OmiWebhookPayload(BaseModel):
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
+
+def extract_segments(payload: OmiWebhookPayload):
+    """
+    Returns a list of (text, start, end) tuples from segments or transcript.
+    """
+    if payload.segments:
+        return [(seg.text, seg.start, seg.end) for seg in payload.segments]
+    # fallback: treat whole transcript as one segment
+    text = payload.transcript.strip()
+    if text:
+        return [(text, 0.0, 0.0)]
+    return []
 
 def format_transcript_with_speakers(payload: OmiWebhookPayload) -> str:
     """
@@ -131,6 +127,32 @@ async def analyze_transcript(formatted: str) -> dict:
         raise RuntimeError(f"Gemini AI call failed: {e}")
 
 
+def mock_analysis(formatted: str) -> dict:
+    """Return a realistic mock response for testing when Gemini quota is exhausted."""
+    # Extract speakers from the formatted transcript
+    speakers_found = set(re.findall(r"\b(S\d+)\b", formatted))
+    speakers = {s: f"Speaker {s}" for s in sorted(speakers_found)} or {"S1": "Speaker"}
+    lines = [l.strip() for l in formatted.split("\n") if l.strip()]
+
+    key_points = []
+    for line in lines[:3]:
+        ts_match = re.search(r"\[([\d.]+)s", line)
+        sp_match = re.search(r"(S\d+):", line)
+        text = re.sub(r"^\[.*?\]\s*S\d+:\s*", "", line)
+        key_points.append({
+            "timestamp": ts_match.group(1) + "s" if ts_match else "0.0s",
+            "speaker": sp_match.group(1) if sp_match else "S1",
+            "point": text[:80],
+        })
+
+    return {
+        "speakers": speakers,
+        "headline": f"Conversation between {len(speakers)} speakers ({', '.join(sorted(speakers))})",
+        "key_points": key_points,
+        "_demo_mode": True,
+    }
+
+
 # ── Routes ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -150,17 +172,52 @@ async def webhook(
             detail="No transcript content provided.",
         )
 
-    logger.info("Processing transcript for user=%s (%d chars)", user_id, len(formatted))
+    # --- SOS/Police keyword detection ---
+    segments = extract_segments(payload)
+    sos_keyword = "share the location to select contact"
+    police_keyword = "police"
+    sos_count = 5
+    sos_window = 10.0  # seconds
+    sos_times = []
+    police_times = []
+    for text, start, end in segments:
+        # Lowercase for matching
+        t = text.lower()
+        # Find all occurrences in this segment
+        idx = 0
+        while True:
+            idx = t.find(sos_keyword, idx)
+            if idx == -1:
+                break
+            sos_times.append(start)
+            idx += len(sos_keyword)
+        idx = 0
+        while True:
+            idx = t.find(police_keyword, idx)
+            if idx == -1:
+                break
+            police_times.append(start)
+            idx += len(police_keyword)
 
-    try:
-        result = await analyze_transcript(formatted)
-        return {
-            "user_id": user_id,
-            "formatted_transcript": formatted,
-            **result,
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e),
-        )
+    sos_alert = False
+    police_alert = False
+    # Check for N sos keywords in T seconds
+    sos_times.sort()
+    for i in range(len(sos_times) - sos_count + 1):
+        if sos_times[i + sos_count - 1] - sos_times[i] <= sos_window:
+            sos_alert = True
+            break
+    # Check for N police keywords in T seconds (same logic, can adjust if needed)
+    police_times.sort()
+    for i in range(len(police_times) - sos_count + 1):
+        if police_times[i + sos_count - 1] - police_times[i] <= sos_window:
+            police_alert = True
+            break
+
+    response = {
+        "user_id": user_id,
+        "formatted_transcript": formatted,
+        "sos_alert": sos_alert,
+        "police_alert": police_alert,
+    }
+    return response
